@@ -113,19 +113,24 @@
   const renderizarMarkdown = crearRenderizadorMarkdown();
   const textoCrudoPorBurbuja = new WeakMap();
 
-  function establecerTextoAsistente(bubble, texto) {
-    textoCrudoPorBurbuja.set(bubble, texto);
+  // Pinta `texto` como markdown dentro de `nodo` (o como texto plano si no se puede).
+  function pintarMarkdown(nodo, texto) {
     if (renderizarMarkdown) {
       try {
-        bubble.innerHTML = renderizarMarkdown(texto);
-        bubble.classList.add("md");
+        nodo.innerHTML = renderizarMarkdown(texto);
+        nodo.classList.add("md");
         return;
       } catch (error) {
         console.error("No se pudo renderizar el markdown del mensaje:", error);
       }
     }
-    bubble.classList.remove("md");
-    bubble.textContent = texto;
+    nodo.classList.remove("md");
+    nodo.textContent = texto;
+  }
+
+  function establecerTextoAsistente(bubble, texto) {
+    textoCrudoPorBurbuja.set(bubble, texto);
+    pintarMarkdown(bubble, texto);
   }
 
   function agregarTextoAsistente(bubble, fragmento) {
@@ -495,7 +500,9 @@
     hacerPlegable(head, card);
 
     const body = el("div", "tool-card__body");
-    body.appendChild(el("p", null, payload.pregunta || "El agente necesita tu confirmación."));
+    const preguntaEl = el("div", "tool-card__pregunta");
+    pintarMarkdown(preguntaEl, payload.pregunta || "El agente necesita tu confirmación.");
+    body.appendChild(preguntaEl);
 
     const chipsWrap = el("div", "tool-card__chips");
     const hallazgos = payload.hallazgos || {};
@@ -535,11 +542,12 @@
 
     if (!activo) {
       confirmBannerText.textContent = "";
+      confirmBannerText.classList.remove("md");
       confirmBannerHallazgos.innerHTML = "";
       return;
     }
 
-    confirmBannerText.textContent = pregunta || "El agente necesita tu confirmación para continuar.";
+    pintarMarkdown(confirmBannerText, pregunta || "El agente necesita tu confirmación para continuar.");
     confirmBannerHallazgos.innerHTML = "";
     const confirmaciones =
       hallazgos && Array.isArray(hallazgos.confirmaciones) ? hallazgos.confirmaciones : [];
