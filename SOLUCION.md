@@ -784,6 +784,24 @@ Medirlo por orden y no por la factura mensual permite distinguir si el
 total subió por mayor volumen, que es buena noticia, o porque cada caso se
 volvió más caro, que hay que ir a mirar.
 
+### Madurez frente al modelo estándar de agentes en producción
+
+| Capa | Estado en esta solución |
+|---|---|
+| System prompt | `src/agente/prompt.md`. Las reglas de negocio no viven ahí: viven en código. |
+| Recuperación de conocimiento (RAG) | No aplica: los datos son estructurados y se leen por herramienta, que es exacto donde la búsqueda semántica es aproximada. |
+| Llamada a herramientas | Seis herramientas tipadas con zod: cinco operativas y `oc_leer_excel`, un stub deliberado. El modelo no afirma ningún valor que no venga de una herramienta (CA2). |
+| Acceso por roles | Fuera de alcance del PRD. Declarado en supuestos; en producción sale de la sesión autenticada. |
+| Defensa ante inyección de prompt | El modelo solo extrae campos acotados; las decisiones están en código; `oc_crear` revalida por su cuenta sin confiar en lo que recibe. |
+| Caché y enrutamiento de modelos | No hace falta a esta escala. Costo medido: medio centavo por orden. |
+| Observabilidad | `out/log.jsonl` por llamada, `control.csv` por intento, `trazabilidad.json` por campo, tokens y costo por sesión. |
+| Evaluaciones | `demo.ts` sin modelo (34 aserciones), 135 pruebas, CI en cada commit. Un cambio en el prompt no puede romper un control. |
+
+Las dos capas ausentes, roles y caché, lo están por alcance y por escala, no
+por omisión. Las dos que más fallan en producción según la experiencia del
+sector, la inyección y los cambios sin evaluar, están cubiertas por diseño:
+las reglas no dependen del prompt.
+
 ## 11. Uso de IA
 
 **Qué se usó y para qué.** Claude Code fue la herramienta principal de
