@@ -315,6 +315,26 @@
   // Tarjetas de llamada a herramienta — nunca texto plano indistinguible
   // ---------------------------------------------------------------------
 
+  // Cabecera de la tarjeta: siempre visible (nombre + estado en una línea);
+  // al hacer clic, o con Enter/Espacio, se despliega el cuerpo.
+  function hacerPlegable(head, card) {
+    head.setAttribute("role", "button");
+    head.tabIndex = 0;
+    const sincronizar = () => head.setAttribute("aria-expanded", String(card.classList.contains("is-open")));
+    const alternar = () => {
+      card.classList.toggle("is-open");
+      sincronizar();
+    };
+    head.addEventListener("click", alternar);
+    head.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        alternar();
+      }
+    });
+    sincronizar();
+  }
+
   function crearToolCard(id, name, args) {
     clearEmptyState();
     const card = el("div", "tool-card pending");
@@ -326,7 +346,7 @@
     const status = el("span", "tool-card__status", "ejecutando…");
     head.appendChild(status);
     head.appendChild(el("span", "tool-card__chevron", "▶"));
-    head.addEventListener("click", () => card.classList.toggle("is-open"));
+    hacerPlegable(head, card);
 
     const body = el("div", "tool-card__body");
     body.appendChild(el("div", "tool-card__section-label", "Entrada"));
@@ -424,7 +444,7 @@
 
     if (resultado.ok !== true) {
       card.classList.add("error");
-      if (status) status.textContent = "error";
+      if (status) status.textContent = "ERROR";
       const errorNode = el("p", "tool-card__error", resultado.error || "Error sin detalle.");
       resultSlot.appendChild(errorNode);
       if (resultado.codigo) {
@@ -437,13 +457,11 @@
     const { nivel, chips } = clasificarResultado(resultado);
     card.classList.add(nivel);
     if (status) {
-      const etiquetas = {
-        ok: "ok",
-        derivado: "derivado",
-        confirmacion: "confirmación",
-        bloqueo: "bloqueo",
-      };
-      status.textContent = etiquetas[nivel] || nivel;
+      // La herramienta respondió sin error: el estado es OK. Si el resultado
+      // trae un bloqueo o una confirmación pendiente, se indica al lado y el
+      // color de la tarjeta sigue la severidad.
+      const matices = { bloqueo: " · bloqueo", confirmacion: " · confirmación" };
+      status.textContent = "OK" + (matices[nivel] || "");
     }
 
     const pre = el("pre", "tool-card__pre", safeJsonStringify(resultado.data ?? {}));
@@ -474,7 +492,7 @@
     ultimaConfirmacionStatus = el("span", "tool-card__status", "pendiente");
     head.appendChild(ultimaConfirmacionStatus);
     head.appendChild(el("span", "tool-card__chevron", "▶"));
-    head.addEventListener("click", () => card.classList.toggle("is-open"));
+    hacerPlegable(head, card);
 
     const body = el("div", "tool-card__body");
     body.appendChild(el("p", null, payload.pregunta || "El agente necesita tu confirmación."));

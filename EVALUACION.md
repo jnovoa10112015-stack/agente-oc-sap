@@ -45,6 +45,7 @@ declaré al escribirlos.
 | Concurrencia | 20 intentos simultáneos | Un registro de orden y todas las filas de auditoría, dentro de un proceso |
 | Evidencia PDF | `src/tools/evidencia-pdf.test.ts` y una aserción por caso en la demo | El PDF existe, no está vacío y contiene el sha256 del `.txt` |
 | Front con markdown | Edge headless (Windows) controlado por CDP contra el servidor real con un modelo simulado que devuelve markdown; más 16 casos del renderizador con el `marked` fijado | Tabla, negritas, lista y encabezado se renderizan; el HTML crudo, los enlaces `javascript:` y las imágenes quedan como texto o sin enlace; el mensaje del usuario se muestra como texto; la consola del navegador queda sin entradas. Lo corrí una vez a mano con un script que no está en el repo: no forma parte de la suite ni del CI, y solo lo probé en Edge |
+| Front con tarjetas de herramienta | Mismo método (Edge headless por CDP), con un modelo simulado que encadena 6 llamadas a herramientas y un texto largo | Reproduje el defecto: con el chat desbordado, cada tarjeta colapsada medía 2 px de alto aunque su cabecera medía 35. Tras el arreglo miden 37 px y muestran nombre y estado (`OK` o `ERROR`) en una línea, incluso con un nombre muy largo; el clic y Enter las expanden y muestran entrada y resultado. Misma limitación: prueba manual, solo Edge |
 
 Los tests de transporte no son llamadas reales a Google. Ejecutan la
 serialización y los reintentos del SDK, pero el token OAuth y las respuestas

@@ -362,6 +362,9 @@ body {
 
 .tool-card {
   align-self: stretch;
+  /* El chat es una columna flex con scroll: sin esto, overflow: hidden deja
+     la altura mínima en 0 y las tarjetas se aplastan a una línea vacía. */
+  flex-shrink: 0;
   border: 1px solid var(--color-border);
   border-left: 4px solid var(--color-border);
   border-radius: var(--radius);
@@ -384,13 +387,24 @@ body {
 }
 
 .tool-card__name {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
   font-family: var(--font-mono);
   font-size: 12.5px;
   font-weight: 700;
   color: var(--color-text);
 }
 
+.tool-card__head:focus-visible {
+  outline: 2px solid var(--color-user-bg);
+  outline-offset: -2px;
+}
+
 .tool-card__status {
+  flex-shrink: 0;
+  white-space: nowrap;
   margin-left: auto;
   font-size: 11px;
   font-weight: 700;
