@@ -71,6 +71,67 @@
     }
   }
 
+  // ---------------------------------------------------------------------
+  // Markdown de los mensajes del agente (los del usuario van como texto)
+  // ---------------------------------------------------------------------
+
+  const HTML_ESCAPES = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+
+  function escapeHtml(valor) {
+    return String(valor).replace(/[&<>"']/g, (c) => HTML_ESCAPES[c]);
+  }
+
+  // marked (cdnjs, versión fijada en index.html) no sanea su salida, así que
+  // el HTML crudo de la entrada se muestra como texto, las imágenes se reducen a
+  // su texto alternativo y solo se enlazan URLs http(s) y mailto.
+  function crearRenderizadorMarkdown() {
+    if (!window.marked || typeof window.marked.Marked !== "function") return null;
+    const instancia = new window.marked.Marked({
+      gfm: true,
+      breaks: true,
+      async: false,
+      renderer: {
+        html({ text }) {
+          return escapeHtml(text);
+        },
+        image({ text }) {
+          return escapeHtml(text);
+        },
+        link({ href, title, tokens }) {
+          const contenido = this.parser.parseInline(tokens);
+          if (!/^(?:https?:\/\/|mailto:)/i.test(href)) return contenido;
+          const atributoTitulo = title ? ` title="${escapeHtml(title)}"` : "";
+          return `<a href="${escapeHtml(href)}"${atributoTitulo} target="_blank" rel="noopener noreferrer">${contenido}</a>`;
+        },
+      },
+    });
+    return (texto) => instancia.parse(texto);
+  }
+
+  // Si marked no cargó (sin red o bloqueado), el chat sigue funcionando y
+  // los mensajes del agente se muestran como texto plano.
+  const renderizarMarkdown = crearRenderizadorMarkdown();
+  const textoCrudoPorBurbuja = new WeakMap();
+
+  function establecerTextoAsistente(bubble, texto) {
+    textoCrudoPorBurbuja.set(bubble, texto);
+    if (renderizarMarkdown) {
+      try {
+        bubble.innerHTML = renderizarMarkdown(texto);
+        bubble.classList.add("md");
+        return;
+      } catch (error) {
+        console.error("No se pudo renderizar el markdown del mensaje:", error);
+      }
+    }
+    bubble.classList.remove("md");
+    bubble.textContent = texto;
+  }
+
+  function agregarTextoAsistente(bubble, fragmento) {
+    establecerTextoAsistente(bubble, (textoCrudoPorBurbuja.get(bubble) || "") + fragmento);
+  }
+
   function safeJsonStringify(value) {
     try {
       return JSON.stringify(value, null, 2);
@@ -165,7 +226,7 @@
       case "message":
         closeAssistantBubble();
         currentAssistantBubble = crearBurbujaAssistant();
-        currentAssistantBubble.textContent = item.text || "";
+        establecerTextoAsistente(currentAssistantBubble, item.text || "");
         closeAssistantBubble();
         break;
       case "tool_call":
@@ -594,7 +655,7 @@
       case "message":
         ocultarPensando();
         if (!currentAssistantBubble) currentAssistantBubble = crearBurbujaAssistant();
-        currentAssistantBubble.textContent += (data && data.text) || "";
+        agregarTextoAsistente(currentAssistantBubble, (data && data.text) || "");
         scrollToBottom();
         if (data && data.final) closeAssistantBubble();
         break;

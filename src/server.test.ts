@@ -86,6 +86,15 @@ describe("HTTP y SSE locales", () => {
     expect(r.status).toBe(200);
     expect(await r.json()).toMatchObject({ provider: "vertex", configured: true });
   });
+  test("el front permite el script de markdown solo desde cdnjs y /favicon.ico no es un error", async () => {
+    const app = crearAplicacion({ configuracion });
+    const pagina = await app(new Request("http://local/"));
+    expect(pagina.headers.get("content-security-policy")).toContain("script-src 'self' https://cdnjs.cloudflare.com;");
+    const html = await pagina.text();
+    expect(html).toMatch(/cdnjs\.cloudflare\.com\/ajax\/libs\/marked\/\d+\.\d+\.\d+\/lib\/marked\.umd\.min\.js/);
+    expect(html).toContain('integrity="sha512-');
+    expect((await app(new Request("http://local/favicon.ico"))).status).toBe(204);
+  });
   test("no publica archivos ajenos al front", async () => {
     const app = crearAplicacion({ configuracion });
     expect((await app(new Request("http://local/"))).status).toBe(200);

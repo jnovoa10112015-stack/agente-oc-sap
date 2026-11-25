@@ -18,7 +18,7 @@ credenciales reales ni hice llamadas a las APIs de Google.
 |---|---|---|
 | Instalación | `bun install` sobre un clon nuevo | Funciona tras limpiar la caché global de Bun (ver abajo) |
 | Tipos | `bunx tsc --noEmit` | Sin errores |
-| Pruebas | `bun test` | 134 pruebas en 10 archivos, 580 aserciones `expect()`, 0 fallos |
+| Pruebas | `bun test` | 135 pruebas en 10 archivos, 584 aserciones `expect()`, 0 fallos |
 | Demo | `bun run demo` | 34 de 34 comprobaciones sobre los seis paquetes |
 
 **Un fallo de instalación que encontré.** En el primer intento, `bun install`
@@ -44,6 +44,7 @@ declaré al escribirlos.
 | Herramientas y SAP | Fixtures y directorios temporales | Bloqueos, confirmaciones, evidencia TXT y PDF, prevención de duplicados |
 | Concurrencia | 20 intentos simultáneos | Un registro de orden y todas las filas de auditoría, dentro de un proceso |
 | Evidencia PDF | `src/tools/evidencia-pdf.test.ts` y una aserción por caso en la demo | El PDF existe, no está vacío y contiene el sha256 del `.txt` |
+| Front con markdown | Edge headless (Windows) controlado por CDP contra el servidor real con un modelo simulado que devuelve markdown; más 16 casos del renderizador con el `marked` fijado | Tabla, negritas, lista y encabezado se renderizan; el HTML crudo, los enlaces `javascript:` y las imágenes quedan como texto o sin enlace; el mensaje del usuario se muestra como texto; la consola del navegador queda sin entradas. Lo corrí una vez a mano con un script que no está en el repo: no forma parte de la suite ni del CI, y solo lo probé en Edge |
 
 Los tests de transporte no son llamadas reales a Google. Ejecutan la
 serialización y los reintentos del SDK, pero el token OAuth y las respuestas

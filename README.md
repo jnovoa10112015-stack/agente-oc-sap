@@ -155,7 +155,11 @@ la guía antes de desplegar.
 
 ## Arquitectura
 
-- `web/`: chat en HTML, CSS y JavaScript; recibe eventos SSE.
+- `web/`: chat en HTML, CSS y JavaScript; recibe eventos SSE. Los mensajes del
+  agente se muestran con markdown (`marked` 15.0.12 desde cdnjs, con
+  integridad verificada y sin HTML crudo); los del usuario, como texto. El
+  navegador necesita acceso a cdnjs.cloudflare.com: sin él, el chat funciona y
+  muestra el texto del agente sin formato.
 - `src/server.ts`: HTTP, validación de peticiones y exclusión de turnos por sesión.
 - `src/config.ts`: selección y validación del proveedor.
 - `src/agente/`: ciclo, prompt y SDK de Google para Gemini/Vertex.

@@ -12,7 +12,7 @@ const ARCHIVOS_WEB: Record<string, string> = {
 const CABECERAS = {
   "X-Content-Type-Options": "nosniff",
   "Referrer-Policy": "same-origin",
-  "Content-Security-Policy": "default-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
+  "Content-Security-Policy": "default-src 'self'; script-src 'self' https://cdnjs.cloudflare.com; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
 };
 
 type OpcionesAplicacion = {
@@ -97,6 +97,8 @@ export function crearAplicacion(opciones: OpcionesAplicacion = {}): (req: Reques
     try {
       const url = new URL(req.url);
       if (req.method === "GET" && url.pathname === "/api/live") return json({ ok: true });
+      // El front no tiene icono; 204 evita un 404 en la consola del navegador.
+      if (req.method === "GET" && url.pathname === "/favicon.ico") return new Response(null, { status: 204, headers: CABECERAS });
       if (req.method === "GET" && url.pathname === "/api/health") {
         if (!configuracion.ok) return json({ ok: false, error: configuracion.error }, 503);
         const c = configuracion.data;
