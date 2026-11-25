@@ -1,0 +1,36 @@
+name: Verificar
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  verificar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - run: bun install --frozen-lockfile --ignore-scripts
+      - run: bun run verify
+      - run: docker build --platform linux/amd64 --tag agente-oc:verificado .
+      - run: bash scripts/smoke-container.sh agente-oc:verificado
+      - name: Probar dependencias de producción sin red externa
+        run: docker run --rm --pull=never --network none --mount "type=bind,source=$PWD/src,target=/app/src,readonly" agente-oc:verificado bun test /app/src
+      - run: bun run package
+      - name: Verificar el paquete distribuible
+        run: |
+          release_dir=$(mktemp -d)
+          trap 'rm -rf "$release_dir"' EXIT
+          tar -xzf out/agente-oc-periferia-dev.tar.gz -C "$release_dir"
+          cd "$release_dir"
+          bun install --frozen-lockfile --ignore-scripts
+          bun run verify
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agente-oc-fuentes
+          path: |
+            out/agente-oc-periferia-dev.tar.gz
+            out/agente-oc-periferia-dev.tar.gz.sha256
+          retention-days: 7

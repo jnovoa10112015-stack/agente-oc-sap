@@ -1,0 +1,833 @@
+/**
+ * Las 6 herramientas del agente (PRD 6.2). Cada export es una herramienta:
+ * el nombre que ve el modelo es "oc_<export>" (ej. `crear` → `oc_crear`).
+ *
+ * Reglas de CLAUDE.md que gobiernan este archivo:
+ * - Nunca lanzan excepción hacia el agente: cualquier I/O va envuelto y un
+ *   error se convierte en `{ ok: false, error }`.
+ * - Devuelven un string (JSON.stringify de un ResultadoHerramienta<T>).
+ * - Las rutas se resuelven siempre desde ctx.directory, nunca hardcodeadas.
+ * - RC1–RC10 no se evalúan acá: viven en src/reglas/controles.ts. Este
+ *   archivo solo orquesta lectura, maestros, controles, payload y SAP.
+ */
+
+import { mkdir, readdir, stat, appendFile, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { z } from "zod";
+import {
+  PaqueteSchema,
+  SolicitudSchema,
+  CorreoSchema,
+  FechaDocumentoSchema,
+  EmailSchema,
+  OrdenCompraSchema,
+  ValidacionSchema,
+  type Paquete,
+  type OrdenCompra,
+  type ResultadoHerramienta,
+  type ResultadoCrearOC,
+} from "../tipos";
+import { cargarMaestros } from "../maestros";
+import { validar as validarControles } from "../reglas/controles";
+import { validarIntegridad } from "../reglas/integridad";
+import { crearSapMock } from "../sap/mock";
+import type { SapAdapter } from "../sap/adapter";
+import { generarPdfEvidencia } from "./evidencia-pdf";
+
+// ─────────────────────────────────────────────────────────────
+// Infraestructura común a las 6 herramientas
+// ─────────────────────────────────────────────────────────────
+
+type Ctx = { directory: string; sessionId: string };
+
+/** Convierte el mapa de schemas de `args` en el tipo que recibe `execute`. */
+type InferirArgs<A extends Record<string, z.ZodType>> = {
+  [K in keyof A]: z.infer<A[K]>;
+};
+
+function ok<T>(data: T): ResultadoHerramienta<T> {
+  return { ok: true, data };
+}
+
+function err(error: string, codigo?: string): ResultadoHerramienta<never> {
+  return codigo ? { ok: false, error, codigo } : { ok: false, error };
+}
+
+function responder<T>(resultado: ResultadoHerramienta<T>): string {
+  return JSON.stringify(resultado);
+}
+
+/**
+ * Único adaptador SAP mock del proceso. Se cachea por `directory` (en la
+ * práctica siempre el mismo, la raíz del proyecto) para que las 6
+ * herramientas compartan una sola instancia sin hardcodear la ruta.
+ */
+const sapCache = new Map<string, SapAdapter>();
+
+function obtenerSap(directory: string): SapAdapter {
+  if (!sapCache.has(directory)) sapCache.set(directory, crearSapMock(directory));
+  return sapCache.get(directory)!;
+}
+
+/**
+ * El identificador de caso viaja directo a rutas de archivo (fixtures/ y
+ * out/). Sin esta validación, un caso como "../../etc" escaparía de las
+ * carpetas esperadas — por eso se valida el formato ACÁ, en el esquema de
+ * argumentos de cada herramienta, antes de que el valor toque cualquier ruta.
+ */
+const CASO_REGEX = /^[A-Za-z0-9_-]+$/;
+const CASO_REGEX_MENSAJE =
+  'El identificador de caso solo puede tener letras, números, "-" y "_" (sin "/", ".." ni espacios).';
+
+function rutaCaso(directory: string, caso: string): string {
+  return `${directory}/fixtures/reto-03/solicitudes/${caso}`;
+}
+
+/**
+ * Defensa en profundidad (misma razón que la Tarea 2 de `oc_crear`): el
+ * esquema de `args` de cada herramienta ya exige `CASO_REGEX`, pero eso solo
+ * protege si quien llama a `execute()` pasó los argumentos por ese
+ * `safeParse` primero. La garantía tiene que estar también acá, en la
+ * herramienta que efectivamente arma la ruta — no soltarla a la confianza en
+ * el llamador. Devuelve el error de la herramienta si el formato no cumple.
+ */
+function validarFormatoCaso(caso: string): ResultadoHerramienta<never> | null {
+  return CASO_REGEX.test(caso) ? null : err(`"${caso}": ${CASO_REGEX_MENSAJE}`);
+}
+
+async function existeDirectorio(ruta: string): Promise<boolean> {
+  try {
+    const info = await stat(ruta);
+    return info.isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+async function listarCasosDisponibles(directory: string): Promise<string[]> {
+  const base = `${directory}/fixtures/reto-03/solicitudes`;
+  try {
+    const entradas = await readdir(base, { withFileTypes: true });
+    return entradas
+      .filter((entrada) => entrada.isDirectory())
+      .map((entrada) => entrada.name)
+      .sort();
+  } catch {
+    return [];
+  }
+}
+
+type LecturaJson =
+  | { existe: true; ok: true; datos: unknown }
+  | { existe: true; ok: false; error: string }
+  | { existe: false };
+
+async function leerJsonOpcional(ruta: string): Promise<LecturaJson> {
+  const archivo = Bun.file(ruta);
+  let existe: boolean;
+  try {
+    existe = await archivo.exists();
+  } catch (e) {
+    return { existe: true, ok: false, error: `No se pudo verificar ${ruta}: ${e instanceof Error ? e.message : String(e)}` };
+  }
+  if (!existe) return { existe: false };
+  let texto: string;
+  try {
+    texto = await archivo.text();
+  } catch (e) {
+    return { existe: true, ok: false, error: `No se pudo leer ${ruta}: ${e instanceof Error ? e.message : String(e)}` };
+  }
+  try {
+    return { existe: true, ok: true, datos: JSON.parse(texto) as unknown };
+  } catch {
+    return { existe: true, ok: false, error: `El archivo ${ruta} no contiene JSON válido.` };
+  }
+}
+
+type LecturaTexto = { ok: true; existe: true; texto: string } | { ok: true; existe: false } | { ok: false; error: string };
+
+async function leerTextoOpcional(ruta: string): Promise<LecturaTexto> {
+  const archivo = Bun.file(ruta);
+  let existe: boolean;
+  try {
+    existe = await archivo.exists();
+  } catch (e) {
+    return { ok: false, error: `No se pudo verificar ${ruta}: ${e instanceof Error ? e.message : String(e)}` };
+  }
+  if (!existe) return { ok: true, existe: false };
+  try {
+    return { ok: true, existe: true, texto: await archivo.text() };
+  } catch (e) {
+    return { ok: false, error: `No se pudo leer ${ruta}: ${e instanceof Error ? e.message : String(e)}` };
+  }
+}
+
+/** Extrae el primer grupo de captura de `patron` en `texto`, o `null`. */
+function extraerLinea(texto: string, patron: RegExp): string | null {
+  const valor = texto.match(patron)?.[1];
+  return valor ? valor.trim() : null;
+}
+
+/**
+ * Parseo determinístico (regex sobre texto plano, nunca modelo de lenguaje)
+ * de una línea "TOTAL..." tipo "TOTAL (IVA incluido): COP 11.400.000" o
+ * "TOTAL: COP 3.200.000" → { moneda: "COP", total: 11400000 }.
+ */
+function parseLineaTotal(texto: string, prefijo: string): { moneda: "COP" | "USD"; total: number } | null {
+  const linea = texto.split(/\r?\n/).find((l) => l.trim().startsWith(prefijo));
+  if (!linea) return null;
+  const match = linea.match(/\b(COP|USD)\s+(\d[\d.,]*)(?=\s|$)/);
+  const moneda = match?.[1];
+  const montoTexto = match?.[2];
+  if ((moneda !== "COP" && moneda !== "USD") || !montoTexto) return null;
+  const total = parseMontoDocumento(montoTexto);
+  if (total === null) return null;
+  return { moneda, total };
+}
+
+/** Miles agrupados y hasta dos decimales; rechaza agrupaciones ambiguas. */
+export function parseMontoDocumento(texto: string): number | null {
+  let normalizado: string;
+  if (/^\d{1,3}(\.\d{3})+(,\d{1,2})?$/.test(texto)) normalizado = texto.replace(/\./g, "").replace(",", ".");
+  else if (/^\d{1,3}(,\d{3})+(\.\d{1,2})?$/.test(texto)) normalizado = texto.replace(/,/g, "");
+  else if (/^\d+(,\d{1,2})?$/.test(texto)) normalizado = texto.replace(",", ".");
+  else if (/^\d+\.\d{1,2}$/.test(texto)) normalizado = texto;
+  else return null;
+  const valor = Number(normalizado);
+  return Number.isFinite(valor) && valor > 0 && valor <= Number.MAX_SAFE_INTEGER ? valor : null;
+}
+
+/** "Validez de la oferta: 30 días" → null. "... hasta 2026-09-30" → "2026-09-30". */
+function extraerValidezHasta(texto: string): string | null {
+  const valor = extraerLinea(texto, /^Validez de la oferta:\s*(.+)$/m);
+  if (!valor) return null;
+  return valor.match(/\d{4}-\d{2}-\d{2}/)?.[0] ?? null;
+}
+
+/** "COTIZACIÓN COT-TS-2026-0451" (primera línea) → "COT-TS-2026-0451". */
+function extraerCotizacionRef(texto: string): string | null {
+  return extraerLinea(texto, /COTIZACI[ÓO]N\s+(\S+)/);
+}
+
+/**
+ * Determinístico (nunca el modelo): ¿el cuerpo del correo aprueba la
+ * solicitud? `cuerpo.includes("Aprobado")` da un falso positivo con "No
+ * Aprobado, revisar presupuesto" (hallazgo de auditoría externa). Acá se
+ * exige la palabra completa "aprobado"/"aprobada" y se descarta si, en la
+ * misma oración, aparece antes una negación ("no", "sin", "rechazad[oa]").
+ * Exportada para poder testearla directo, sin pasar por archivos.
+ */
+export function estaAprobado(cuerpo: string): boolean {
+  const normalizado = cuerpo
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+  // No rescatar una aprobación de un mensaje anterior citado o reenviado.
+  const actual = normalizado.split(/\n\s*(?:>|[-]{2,}\s*(?:mensaje|original)|(?:de|from):)/)[0] ?? "";
+  if (/\bno\b[^.\n;]{0,80}\b(?:aprobad[oa]s?|aprobar|proceder|procede|crear|autoriz(?:ad[oa]s?|a[dr]?))\b/.test(actual)) return false;
+  if (/\bsin\b[^.\n;]{0,40}\b(?:aprobar|aprobad[oa]s?|autorizacion)\b/.test(actual)) return false;
+  if (/\b(?:rechazad[oa]s?|rechazo|pendiente|condicionad[oa]|sujet[oa] a)\b/.test(actual)) return false;
+  if (/\b(?:si|cuando|una vez|hasta que)\b[^.\n;]*\baprobad[oa]s?\b/.test(actual)) return false;
+  if (/\baprobad[oa]s?\b[^.\n;]*\b(?:si|cuando|siempre que)\b/.test(actual)) return false;
+  if (/\baprobad[oa]s?\s*:\s*(?:false|no|0)\b/.test(actual)) return false;
+  // Afirmación explícita. Ante ambigüedad se solicita una aprobación clara.
+  return actual.split(/[.\n;]+/).some((oracion) => !oracion.includes("?") && /^\s*(?:estado\s*:\s*|(?:la\s+)?(?:compra|solicitud|orden)\s+(?:esta\s+)?)?aprobad[oa]s?\b/.test(oracion));
+}
+
+/** Forma cruda de aprobacion.json (PRD 7.1). No vive en tipos.ts porque no es
+ * el paquete normalizado: es el archivo tal como llega, con "para"/"cc" que
+ * el paquete no conserva. */
+const AprobacionArchivoSchema = z.object({
+  de: EmailSchema,
+  para: z.string().optional(),
+  cc: z.array(z.string()).optional(),
+  fecha: FechaDocumentoSchema,
+  asunto: z.string().optional(),
+  cuerpo: z.string().optional(),
+});
+
+// ─────────────────────────────────────────────────────────────
+// 1. oc_leer_paquete
+// ─────────────────────────────────────────────────────────────
+
+const leerPaqueteArgs = {
+  caso: z
+    .string()
+    .regex(CASO_REGEX, CASO_REGEX_MENSAJE)
+    .describe("Nombre de la carpeta del caso en fixtures/reto-03/solicitudes/, ej. \"sol-001\"."),
+};
+
+export const leer_paquete = {
+  description:
+    "Lee correo, solicitud, cotización, aprobación y factura (si existen) de un caso y devuelve el paquete normalizado.",
+  args: leerPaqueteArgs,
+  async execute(args: InferirArgs<typeof leerPaqueteArgs>, ctx: Ctx): Promise<string> {
+    const formatoInvalido = validarFormatoCaso(args.caso);
+    if (formatoInvalido) return responder(formatoInvalido);
+    const base = rutaCaso(ctx.directory, args.caso);
+
+    if (!(await existeDirectorio(base))) {
+      const disponibles = await listarCasosDisponibles(ctx.directory);
+      return responder(
+        err(
+          `El caso "${args.caso}" no existe en fixtures/reto-03/solicitudes/. Casos disponibles: ${
+            disponibles.length > 0 ? disponibles.join(", ") : "(no se encontró ninguno)"
+          }.`
+        )
+      );
+    }
+
+    // correo.json — obligatorio.
+    const correoLectura = await leerJsonOpcional(`${base}/correo.json`);
+    if (!correoLectura.existe) {
+      return responder(err(`Falta correo.json en el caso "${args.caso}".`));
+    }
+    if (!correoLectura.ok) return responder(err(correoLectura.error));
+    const correoParsed = CorreoSchema.safeParse(correoLectura.datos);
+    if (!correoParsed.success) {
+      return responder(err(`correo.json del caso "${args.caso}" no cumple el esquema esperado: ${correoParsed.error.message}`));
+    }
+
+    // solicitud.json — obligatorio.
+    const solicitudLectura = await leerJsonOpcional(`${base}/solicitud.json`);
+    if (!solicitudLectura.existe) {
+      return responder(err(`Falta solicitud.json en el caso "${args.caso}".`));
+    }
+    if (!solicitudLectura.ok) return responder(err(solicitudLectura.error));
+    const solicitudParsed = SolicitudSchema.safeParse(solicitudLectura.datos);
+    if (!solicitudParsed.success) {
+      return responder(
+        err(`solicitud.json del caso "${args.caso}" no cumple el esquema esperado: ${solicitudParsed.error.message}`)
+      );
+    }
+
+    // aprobacion.json — opcional. `aprobado` se calcula de forma
+    // determinística con `estaAprobado`, nunca con el modelo de lenguaje.
+    const aprobacionLectura = await leerJsonOpcional(`${base}/aprobacion.json`);
+    let aprobacion: Paquete["aprobacion"] = null;
+    if (aprobacionLectura.existe) {
+      if (!aprobacionLectura.ok) return responder(err(aprobacionLectura.error));
+      const aprobacionParsed = AprobacionArchivoSchema.safeParse(aprobacionLectura.datos);
+      if (!aprobacionParsed.success) {
+        return responder(
+          err(`aprobacion.json del caso "${args.caso}" no cumple el esquema esperado: ${aprobacionParsed.error.message}`)
+        );
+      }
+      const cuerpo = aprobacionParsed.data.cuerpo ?? "";
+      aprobacion = {
+        de: aprobacionParsed.data.de,
+        fecha: aprobacionParsed.data.fecha,
+        aprobado: estaAprobado(cuerpo),
+        texto: cuerpo,
+      };
+    }
+
+    // cotizacion.txt — opcional, parseo por texto plano.
+    const cotizacionLectura = await leerTextoOpcional(`${base}/cotizacion.txt`);
+    if (!cotizacionLectura.ok) return responder(err(cotizacionLectura.error));
+    let cotizacion: Paquete["cotizacion"] = null;
+    if (cotizacionLectura.existe) {
+      const cotizacionTexto = cotizacionLectura.texto;
+      const proveedor = extraerLinea(cotizacionTexto, /^Proveedor:\s*(.+)$/m);
+      const totalInfo = parseLineaTotal(cotizacionTexto, "TOTAL");
+      if (!proveedor || !totalInfo) {
+        return responder(
+          err(`cotizacion.txt del caso "${args.caso}" no tiene el formato esperado (falta "Proveedor:" o una línea "TOTAL").`)
+        );
+      }
+      cotizacion = {
+        proveedor,
+        nit: extraerLinea(cotizacionTexto, /^NIT:\s*(.+)$/m),
+        total: totalInfo.total,
+        moneda: totalInfo.moneda,
+        validez_hasta: extraerValidezHasta(cotizacionTexto),
+        texto: cotizacionTexto,
+      };
+    }
+
+    // factura.txt — opcional, solo en el caso retroactivo.
+    const facturaLectura = await leerTextoOpcional(`${base}/factura.txt`);
+    if (!facturaLectura.ok) return responder(err(facturaLectura.error));
+    let factura: Paquete["factura"] = null;
+    if (facturaLectura.existe) {
+      const facturaTexto = facturaLectura.texto;
+      const numero = extraerLinea(facturaTexto, /No\.\s*(\S+)/);
+      const fecha = extraerLinea(facturaTexto, /^Fecha de emisión:\s*(.+)$/m);
+      const totalInfo = parseLineaTotal(facturaTexto, "TOTAL");
+      if (!numero || !fecha || !totalInfo) {
+        return responder(err(`factura.txt del caso "${args.caso}" no tiene el formato esperado.`));
+      }
+      factura = { numero, fecha, total: totalInfo.total };
+    }
+
+    const paqueteValidado = PaqueteSchema.safeParse({
+      correo: {
+        id: correoParsed.data.id,
+        de: correoParsed.data.de,
+        asunto: correoParsed.data.asunto,
+        fecha: correoParsed.data.fecha,
+      },
+      solicitud: solicitudParsed.data,
+      cotizacion,
+      aprobacion,
+      factura,
+    });
+    if (!paqueteValidado.success) {
+      return responder(err(`El paquete del caso "${args.caso}" no cumple PaqueteSchema: ${paqueteValidado.error.message}`));
+    }
+    return responder(ok(paqueteValidado.data));
+  },
+};
+
+// ─────────────────────────────────────────────────────────────
+// 2. oc_validar
+// ─────────────────────────────────────────────────────────────
+
+const validarArgs = {
+  caso: z.string().regex(CASO_REGEX, CASO_REGEX_MENSAJE).describe("Nombre del caso, solo para trazabilidad del llamado."),
+  paquete: PaqueteSchema.describe("Paquete normalizado devuelto por oc_leer_paquete."),
+};
+
+export const validar = {
+  description: "Aplica los controles RC1–RC10 contra los maestros y devuelve bloqueos, confirmaciones y valores derivados.",
+  args: validarArgs,
+  async execute(args: InferirArgs<typeof validarArgs>, ctx: Ctx): Promise<string> {
+    const maestros = await cargarMaestros(ctx.directory);
+    if (!maestros.ok) return responder(maestros);
+    const integridad = validarIntegridad(args.paquete, maestros.data);
+    if (!integridad.ok) return responder(integridad);
+    const resultado = validarControles(integridad.data, maestros.data);
+    return responder(ok(resultado));
+  },
+};
+
+// ─────────────────────────────────────────────────────────────
+// 3. oc_construir_payload
+// ─────────────────────────────────────────────────────────────
+
+const construirPayloadArgs = {
+  caso: z
+    .string()
+    .regex(CASO_REGEX, CASO_REGEX_MENSAJE)
+    .describe("Nombre del caso; determina dónde se guarda la trazabilidad (out/<caso>/trazabilidad.json)."),
+  paquete: PaqueteSchema.describe("Paquete normalizado devuelto por oc_leer_paquete."),
+  derivados: ValidacionSchema.shape.derivados.describe("derivados de la Validacion devuelta por oc_validar."),
+  validacion: ValidacionSchema.describe("Validacion completa devuelta por oc_validar (se usa para armar las excepciones)."),
+  evidencia_sha256: z
+    .string()
+    .optional()
+    .describe(
+      "sha256 de la evidencia de aprobación, si ya se generó con oc_generar_evidencia. Si se omite, el payload se " +
+        "construye con evidencia_sha256 en blanco (\"\") como marcador de 'pendiente'; oc_crear no depende de este valor."
+    ),
+};
+
+type ResultadoConstruirPayload = { payload: OrdenCompra; trazabilidad_ruta: string };
+
+export const construir_payload = {
+  description: "Construye y valida el payload de la OC (PRD 7.4) a partir del paquete y los derivados de oc_validar.",
+  args: construirPayloadArgs,
+  async execute(args: InferirArgs<typeof construirPayloadArgs>, ctx: Ctx): Promise<string> {
+    const formatoInvalido = validarFormatoCaso(args.caso);
+    if (formatoInvalido) return responder(formatoInvalido);
+    const { paquete, derivados, validacion } = args;
+
+    // Si RC1 no resolvió el proveedor (bloqueo), no hay código SAP real que
+    // poner: se usa "" como marcador explícito de "sin resolver", nunca un
+    // valor inventado. El payload igual se construye porque oc_crear lo
+    // necesita para registrar el intento bloqueado en out/control.csv (HU-5:
+    // "cada intento, exitoso, bloqueado o pendiente, agrega una fila") — este
+    // payload con bloqueos abiertos nunca llega a sap.crearOrden(), oc_crear
+    // corta antes por `validacion.bloqueos.length > 0`.
+    const codigoSapProveedor = derivados.proveedor_codigo_sap ?? "";
+
+    if (paquete.solicitud.moneda !== "COP" && paquete.solicitud.moneda !== "USD") {
+      return responder(err(`Moneda "${paquete.solicitud.moneda}" no soportada: solo se acepta "COP" o "USD".`));
+    }
+    const moneda: "COP" | "USD" = paquete.solicitud.moneda;
+
+    const condicionesPago = paquete.solicitud.condiciones_pago ?? derivados.condiciones_pago;
+    if (!condicionesPago) {
+      return responder(err("No hay condiciones de pago ni en la solicitud ni derivadas del proveedor."));
+    }
+
+    const indicadorIva = paquete.solicitud.indicador_iva ?? derivados.indicador_iva;
+    if (!indicadorIva) {
+      return responder(err("No hay indicador de IVA ni en la solicitud ni derivado del proveedor."));
+    }
+
+    // El NIT del proveedor no está en `derivados`: se toma de la solicitud y,
+    // si falta, de la cotización. Si ninguna lo trae, no se inventa: se detiene.
+    const nitProveedorFuente = paquete.solicitud.proveedor_nit ?? paquete.cotizacion?.nit ?? null;
+    if (!nitProveedorFuente) {
+      return responder(err("No hay NIT del proveedor ni en la solicitud ni en la cotización; no se puede construir el payload."));
+    }
+
+    if (!paquete.aprobacion) {
+      return responder(err("No hay correo de aprobación en el paquete; no se puede construir el payload sin inventar el aprobador."));
+    }
+
+    const cotizacionRef = paquete.cotizacion ? extraerCotizacionRef(paquete.cotizacion.texto) : null;
+
+    const excepciones = [...validacion.bloqueos, ...validacion.confirmaciones].map((hallazgo) => ({
+      codigo: hallazgo.codigo,
+      detalle: hallazgo.detalle,
+      confirmado_por: null,
+    }));
+
+    const candidato = {
+      referencia: {
+        solicitud_id: paquete.solicitud.solicitud_id,
+        correo_id: paquete.correo.id,
+        cotizacion_ref: cotizacionRef,
+      },
+      sociedad: "1000",
+      organizacion_compras: "1000",
+      proveedor: {
+        codigo_sap: codigoSapProveedor,
+        nit: nitProveedorFuente,
+        nombre: paquete.solicitud.proveedor_nombre,
+      },
+      moneda,
+      condiciones_pago: condicionesPago,
+      aprobador: {
+        email: paquete.aprobacion.de,
+        fecha_aprobacion: paquete.aprobacion.fecha,
+        // Todavía no existe: se genera en oc_generar_evidencia. "" es el
+        // marcador explícito de "pendiente" documentado arriba; el llamador
+        // puede pasar evidencia_sha256 si ya la tiene.
+        evidencia_sha256: args.evidencia_sha256 ?? "",
+      },
+      posiciones: [
+        {
+          numero: 10,
+          descripcion: paquete.solicitud.descripcion.slice(0, 40),
+          cantidad: paquete.solicitud.cantidad,
+          unidad: "UN" as const,
+          precio_unitario: paquete.solicitud.valor_unitario,
+          centro_costo: paquete.solicitud.centro_costo,
+          subarea: paquete.solicitud.subarea,
+          indicador_iva: indicadorIva,
+        },
+      ],
+      excepciones,
+    };
+
+    const payloadValidado = OrdenCompraSchema.safeParse(candidato);
+    if (!payloadValidado.success) {
+      return responder(err(`El payload construido no cumple OrdenCompraSchema: ${payloadValidado.error.message}`));
+    }
+    const payload = payloadValidado.data;
+
+    const carpetaCaso = `${ctx.directory}/out/${args.caso}`;
+    const trazabilidad = {
+      "referencia.solicitud_id": "solicitud",
+      "referencia.correo_id": "correo",
+      "referencia.cotizacion_ref": cotizacionRef ? "cotizacion" : "sin_cotizacion",
+      sociedad: "constante_prd",
+      organizacion_compras: "constante_prd",
+      "proveedor.codigo_sap": derivados.proveedor_codigo_sap ? "maestro.proveedores" : "sin_resolver (RC1)",
+      "proveedor.nit": paquete.solicitud.proveedor_nit ? "solicitud" : "cotizacion",
+      "proveedor.nombre": "solicitud",
+      moneda: "solicitud",
+      condiciones_pago: paquete.solicitud.condiciones_pago ? "solicitud" : "derivado",
+      "aprobador.email": "aprobacion",
+      "aprobador.fecha_aprobacion": "aprobacion",
+      "aprobador.evidencia_sha256": args.evidencia_sha256 ? "oc_generar_evidencia" : "pendiente (oc_generar_evidencia)",
+      "posiciones[0].descripcion": "solicitud",
+      "posiciones[0].cantidad": "solicitud",
+      "posiciones[0].precio_unitario": "solicitud",
+      "posiciones[0].unidad": "valor_por_defecto",
+      "posiciones[0].centro_costo": "solicitud",
+      "posiciones[0].subarea": "solicitud",
+      "posiciones[0].indicador_iva": paquete.solicitud.indicador_iva ? "solicitud" : "derivado",
+      excepciones: "validacion",
+    };
+    const trazabilidadRutaRelativa = `out/${args.caso}/trazabilidad.json`;
+    try {
+      await mkdir(carpetaCaso, { recursive: true });
+      await Bun.write(`${carpetaCaso}/trazabilidad.json`, JSON.stringify(trazabilidad, null, 2));
+    } catch (e) {
+      return responder(
+        err(`No se pudo escribir la trazabilidad del caso "${args.caso}": ${e instanceof Error ? e.message : String(e)}`)
+      );
+    }
+
+    const resultado: ResultadoConstruirPayload = { payload, trazabilidad_ruta: trazabilidadRutaRelativa };
+    return responder(ok(resultado));
+  },
+};
+
+// ─────────────────────────────────────────────────────────────
+// 4. oc_generar_evidencia
+// ─────────────────────────────────────────────────────────────
+
+const generarEvidenciaArgs = {
+  caso: z
+    .string()
+    .regex(CASO_REGEX, CASO_REGEX_MENSAJE)
+    .describe("Nombre del caso cuyo aprobacion.json se convierte en evidencia de texto."),
+};
+
+export const generar_evidencia = {
+  description: "Relee aprobacion.json, escribe out/<caso>/aprobacion.txt (y aprobacion.pdf con el mismo contenido) como evidencia y devuelve la ruta y el sha256 del .txt.",
+  args: generarEvidenciaArgs,
+  async execute(args: InferirArgs<typeof generarEvidenciaArgs>, ctx: Ctx): Promise<string> {
+    const formatoInvalido = validarFormatoCaso(args.caso);
+    if (formatoInvalido) return responder(formatoInvalido);
+    const base = rutaCaso(ctx.directory, args.caso);
+    const lectura = await leerJsonOpcional(`${base}/aprobacion.json`);
+    if (!lectura.existe) {
+      return responder(err(`Falta aprobacion.json en el caso "${args.caso}"; no hay evidencia que generar.`));
+    }
+    if (!lectura.ok) return responder(err(lectura.error));
+
+    const parseado = AprobacionArchivoSchema.safeParse(lectura.datos);
+    if (!parseado.success) {
+      return responder(err(`aprobacion.json del caso "${args.caso}" no cumple el esquema esperado: ${parseado.error.message}`));
+    }
+    const datos = parseado.data;
+
+    const encabezados = [
+      `De: ${datos.de}`,
+      `Para: ${datos.para ?? "(no informado)"}`,
+      `Fecha: ${datos.fecha}`,
+      `Asunto: ${datos.asunto ?? "(no informado)"}`,
+    ];
+    const contenido = `${encabezados.join("\n")}\n\n${datos.cuerpo ?? ""}\n`;
+
+    const carpetaCaso = `${ctx.directory}/out/${args.caso}`;
+    const rutaRelativa = `out/${args.caso}/aprobacion.txt`;
+    const sha256 = createHash("sha256").update(contenido).digest("hex");
+    try {
+      await mkdir(carpetaCaso, { recursive: true });
+      await Bun.write(`${carpetaCaso}/aprobacion.txt`, contenido);
+      // P1 (PRD 6.4): mismo contenido en PDF, junto al .txt. La ruta y el sha256
+      // devueltos siguen siendo los del .txt.
+      await Bun.write(`${carpetaCaso}/aprobacion.pdf`, await generarPdfEvidencia(contenido, sha256));
+    } catch (e) {
+      return responder(
+        err(`No se pudo escribir la evidencia del caso "${args.caso}": ${e instanceof Error ? e.message : String(e)}`)
+      );
+    }
+
+    return responder(ok({ ruta: rutaRelativa, sha256 }));
+  },
+};
+
+// ─────────────────────────────────────────────────────────────
+// 5. oc_crear
+// ─────────────────────────────────────────────────────────────
+
+const crearArgs = {
+  caso: z
+    .string()
+    .regex(CASO_REGEX, CASO_REGEX_MENSAJE)
+    .describe("Nombre del caso; identifica la fila que se agrega a out/control.csv."),
+  payload: OrdenCompraSchema.describe("OrdenCompra devuelta por oc_construir_payload."),
+  confirmado: z.boolean().optional().describe("true si el humano confirmó explícitamente las excepciones pendientes."),
+};
+
+async function escribirControl(
+  directory: string,
+  fila: { solicitud_id: string; resultado: string; numero_oc: string; retroactiva: boolean; bloqueos: string; confirmaciones: string }
+): Promise<void> {
+  try {
+    const carpetaOut = `${directory}/out`;
+    await mkdir(carpetaOut, { recursive: true });
+    const ruta = `${carpetaOut}/control.csv`;
+    const encabezado = "solicitud_id,resultado,numero_oc,retroactiva,bloqueos,confirmaciones,ts\n";
+    const escapar = (valor: string): string => `"${valor.replace(/"/g, '""')}"`;
+    const linea =
+      [fila.solicitud_id, fila.resultado, fila.numero_oc, String(fila.retroactiva), fila.bloqueos, fila.confirmaciones, new Date().toISOString()]
+        .map(escapar)
+        .join(",") + "\n";
+    try { await writeFile(ruta, encabezado, { flag: "wx" }); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+    await appendFile(ruta, linea, "utf-8");
+  } catch (e) {
+    console.error(`[oc_crear] No se pudo escribir out/control.csv: ${e instanceof Error ? e.message : String(e)}`);
+    throw new Error("No se pudo registrar la auditoría de la orden.");
+  }
+}
+
+const colasControl = new Map<string, Promise<void>>();
+function registrarControl(directory: string, fila: Parameters<typeof escribirControl>[1]): Promise<void> {
+  const anterior = colasControl.get(directory) ?? Promise.resolve();
+  const siguiente = anterior.catch(() => undefined).then(() => escribirControl(directory, fila));
+  colasControl.set(directory, siguiente);
+  return siguiente.finally(() => {
+    if (colasControl.get(directory) === siguiente) colasControl.delete(directory);
+  });
+}
+
+export const crear = {
+  description:
+    "Crea la OC en el SAP simulado si no hay bloqueos y las confirmaciones pendientes fueron confirmadas. Re-deriva " +
+    "la validación desde el caso (no confía en la que recibe como argumento) y siempre registra el intento en " +
+    "out/control.csv.",
+  args: crearArgs,
+  async execute(args: InferirArgs<typeof crearArgs>, ctx: Ctx): Promise<string> {
+    let numeroOcPersistida: string | undefined;
+    try {
+      const entrada = z.object(crearArgs).safeParse(args);
+      if (!entrada.success) return responder(err("Los argumentos de creación no cumplen el contrato de la orden."));
+      args = { ...entrada.data, confirmado: entrada.data.confirmado };
+      // La garantía de "nunca se crea una OC sin re-validar" vive ACÁ, en la
+      // herramienta, no en quien la llama: ciclo.ts ya re-deriva y compara
+      // antes de despachar, pero eso no alcanza si algo más (otro llamador,
+      // un test, una versión futura del ciclo) invoca esta herramienta
+      // directamente pasando una `validacion` que no corresponde al `payload`.
+      const paqueteJson = await leer_paquete.execute({ caso: args.caso }, ctx);
+      let paqueteResultado: ResultadoHerramienta<Paquete>;
+      try {
+        paqueteResultado = JSON.parse(paqueteJson) as ResultadoHerramienta<Paquete>;
+      } catch (e) {
+        return responder(
+          err(`Error interno re-leyendo el caso "${args.caso}" para validar antes de crear: ${e instanceof Error ? e.message : String(e)}`)
+        );
+      }
+      if (!paqueteResultado.ok) {
+        return responder(err(`No se pudo re-derivar la validación del caso "${args.caso}": ${paqueteResultado.error}`));
+      }
+      const paquete = paqueteResultado.data;
+
+      if (args.payload.referencia.solicitud_id !== paquete.solicitud.solicitud_id) {
+        return responder(
+          err(
+            `El payload recibido corresponde a la solicitud "${args.payload.referencia.solicitud_id}", pero el caso ` +
+              `"${args.caso}" es la solicitud "${paquete.solicitud.solicitud_id}". No se crea la OC: payload y caso no coinciden.`
+          )
+        );
+      }
+
+      const maestros = await cargarMaestros(ctx.directory);
+      if (!maestros.ok) return responder(maestros);
+      const integridad = validarIntegridad(paquete, maestros.data);
+      if (!integridad.ok) return responder(integridad);
+      const validacion = validarControles(paquete, maestros.data);
+
+      const codigosBloqueos = validacion.bloqueos.map((h) => h.codigo).join(";");
+      const codigosConfirmaciones = validacion.confirmaciones.map((h) => h.codigo).join(";");
+      const solicitudId = paquete.solicitud.solicitud_id;
+
+      if (validacion.bloqueos.length > 0) {
+        await registrarControl(ctx.directory, {
+          solicitud_id: solicitudId,
+          resultado: "bloqueada",
+          numero_oc: "",
+          retroactiva: validacion.retroactiva,
+          bloqueos: codigosBloqueos,
+          confirmaciones: codigosConfirmaciones,
+        });
+        const resultado: ResultadoCrearOC = {
+          ok: false,
+          error: `No se crea la OC: hay bloqueos sin resolver (${codigosBloqueos}). Corregir con el solicitante antes de reintentar.`,
+        };
+        return responder(resultado);
+      }
+
+      if (validacion.confirmaciones.length > 0 && args.confirmado !== true) {
+        await registrarControl(ctx.directory, {
+          solicitud_id: solicitudId,
+          resultado: "pendiente_confirmacion",
+          numero_oc: "",
+          retroactiva: validacion.retroactiva,
+          bloqueos: codigosBloqueos,
+          confirmaciones: codigosConfirmaciones,
+        });
+        const resultado: ResultadoCrearOC = {
+          ok: false,
+          error: `Requiere confirmación explícita del humano antes de crear la OC. Códigos pendientes: ${codigosConfirmaciones}. Reintentar con confirmado: true.`,
+        };
+        return responder(resultado);
+      }
+
+      // Verificar también los datos monetarios, contables y la evidencia, no
+      // solo solicitud_id. El llamador no puede sustituir un payload válido.
+      const evidencia = JSON.parse(await generar_evidencia.execute({ caso: args.caso }, ctx)) as ResultadoHerramienta<{ sha256: string }>;
+      if (!evidencia.ok) return responder(evidencia);
+      const reconstruido = JSON.parse(await construir_payload.execute({
+        caso: args.caso, paquete, derivados: validacion.derivados, validacion,
+        evidencia_sha256: evidencia.data.sha256,
+      }, ctx)) as ResultadoHerramienta<ResultadoConstruirPayload>;
+      if (!reconstruido.ok) return responder(reconstruido);
+      const datosOrden = (orden: OrdenCompra) => JSON.stringify({ ...orden, excepciones: [] });
+      if (datosOrden(args.payload) !== datosOrden(reconstruido.data.payload)) {
+        return responder(err("El payload o su evidencia no coinciden con los documentos y maestros vigentes. Vuelve a leer, validar y preparar la orden."));
+      }
+
+      // Las excepciones que quedan en el payload final se re-derivan acá desde
+      // la validación fresca (nunca desde `args.payload.excepciones`, que viene
+      // del llamador) y llevan quién confirmó, cuando hubo confirmación.
+      const usuarioConfirmador = process.env.USUARIO_CONFIRMADOR?.trim() || "analista";
+      const excepcionesFinal = validacion.confirmaciones.map((hallazgo) => ({
+        codigo: hallazgo.codigo,
+        detalle: hallazgo.detalle,
+        confirmado_por: args.confirmado === true ? usuarioConfirmador : null,
+      }));
+      const payloadFinalValidado = OrdenCompraSchema.safeParse({ ...reconstruido.data.payload, excepciones: excepcionesFinal });
+      if (!payloadFinalValidado.success) {
+        return responder(err(`Error interno: el payload final no cumple OrdenCompraSchema: ${payloadFinalValidado.error.message}`));
+      }
+      const payload = payloadFinalValidado.data;
+
+      const sap = obtenerSap(ctx.directory);
+      const existente = await sap.buscarOrdenPorReferencia(payload.referencia.solicitud_id);
+      if (existente) {
+        numeroOcPersistida = existente.numero_oc;
+        await registrarControl(ctx.directory, {
+          solicitud_id: solicitudId,
+          resultado: "idempotente",
+          numero_oc: existente.numero_oc,
+          retroactiva: validacion.retroactiva,
+          bloqueos: codigosBloqueos,
+          confirmaciones: codigosConfirmaciones,
+        });
+        const resultado: ResultadoCrearOC = {
+          ok: true,
+          data: { numero_oc: existente.numero_oc, fecha: "", idempotente: true },
+        };
+        return responder(resultado);
+      }
+
+      const creada = await sap.crearOrden(payload);
+      numeroOcPersistida = creada.numero_oc;
+      await registrarControl(ctx.directory, {
+        solicitud_id: solicitudId,
+        resultado: "creada",
+        numero_oc: creada.numero_oc,
+        retroactiva: validacion.retroactiva,
+        bloqueos: codigosBloqueos,
+        confirmaciones: codigosConfirmaciones,
+      });
+      const resultado: ResultadoCrearOC = {
+        ok: true,
+        data: { numero_oc: creada.numero_oc, fecha: creada.fecha, idempotente: false },
+      };
+      return responder(resultado);
+    } catch {
+      if (numeroOcPersistida) return responder(err(
+        `La OC ${numeroOcPersistida} existe en SAP simulado, pero no se pudo completar su auditoría. Repara el almacenamiento de control y reprocesa la misma solicitud para recuperar el registro sin crear otra orden.`,
+        "AUDITORIA_INCOMPLETA"
+      ));
+      return responder(err("No se pudo registrar la orden en el SAP simulado. Revisa el almacenamiento antes de reintentar; no se asumirá que no existen órdenes previas."));
+    }
+  },
+};
+
+// ─────────────────────────────────────────────────────────────
+// 6. oc_leer_excel — stub P1 (PRD 6.2: prioridad opcional)
+// ─────────────────────────────────────────────────────────────
+
+const leerExcelArgs = {
+  ruta: z.string().describe("Ruta relativa (desde ctx.directory) al archivo .xlsx a leer."),
+};
+
+export const leer_excel = {
+  description: "Lee un archivo Excel de solicitud y devuelve sus filas. No implementado: P1 opcional del PRD.",
+  args: leerExcelArgs,
+  async execute(args: InferirArgs<typeof leerExcelArgs>, ctx: Ctx): Promise<string> {
+    return responder(err("no implementado (P1)"));
+  },
+};

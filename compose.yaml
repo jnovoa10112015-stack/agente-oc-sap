@@ -1,0 +1,15 @@
+services:
+  agente:
+    build: .
+    ports:
+      - "127.0.0.1:3000:8080"
+    env_file: .env
+    environment:
+      PORT: "8080"
+    volumes:
+      - ordenes:/app/out
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+volumes:
+  ordenes:

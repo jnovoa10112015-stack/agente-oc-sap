@@ -1,0 +1,14 @@
+**
+!Dockerfile
+!.dockerignore
+!.gcloudignore
+!package.json
+!bun.lock
+!src/
+!src/**
+!web/
+!web/**
+!fixtures/
+!fixtures/**
+src/**/*.test.ts
+web/CONTRATO.md

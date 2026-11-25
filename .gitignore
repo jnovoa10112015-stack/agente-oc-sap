@@ -1,0 +1,18 @@
+node_modules/
+.env
+.env.local
+.env.*.local
+credentials/
+*-key.json
+*service-account*.json
+*.pem
+out/
+dist/
+.DS_Store
+.claude/
+
+# Material de trabajo propio: NO se entrega
+referencia/
+prompts/
+CLAUDE.md
+PASOS.md
