@@ -1,11 +1,12 @@
 # Verificación del proyecto
 
-Fecha: 24 de noviembre de 2026. Rama: `dev`. Runtime fijado: Bun 1.4.4
+Fecha: 24 de noviembre de 2026. Rama: `main`. Runtime fijado: Bun 1.4.4
 (`package.json`, `Dockerfile` y CI).
 
-Este documento separa tres cosas: lo que verifiqué hoy en mi máquina, lo que
-registré en versiones anteriores y no repetí hoy, y lo que sigue sin probarse.
-No afirmo como verificado nada que no haya vuelto a ejecutar.
+Este documento separa cuatro cosas: lo que verifiqué en mi máquina, lo que
+verificó el CI de GitHub Actions, lo que registré en versiones anteriores y no
+repetí, y lo que sigue sin probarse. No afirmo como verificado nada que no
+haya vuelto a ejecutar.
 
 ## Qué verifiqué hoy
 
@@ -53,23 +54,47 @@ Del PDF de evidencia solo comprobé que empieza con `%PDF-`, que se vuelve a
 cargar con `pdf-lib` y que su texto extraído contiene el sha256. No lo abrí en
 un visor, así que no sé cómo se ve la maquetación.
 
+## Verificado vía CI de GitHub Actions
+
+El workflow `.github/workflows/verify.yml` corrió en GitHub sobre dos pushes a
+`main` y las dos corridas terminaron en éxito:
+
+| Corrida | Commit | Hora (UTC) |
+|---|---|---|
+| 45542710939 | `Agente conversacional de órdenes de compra sobre SAP simulado` | 2026-11-25 03:50 |
+| 45543413028 | `Nombre del servicio` | 2026-11-25 03:56 |
+
+Corre en `ubuntu-latest` con Bun 1.4.4 fijado. Leí el workflow y el resultado
+de cada job, pero no abrí los logs de los pasos: no tengo a la vista las
+cifras de pruebas que imprimió el CI. Un job en éxito significa que cada paso
+terminó con código 0. Qué demuestra cada paso:
+
+| Paso del workflow | Qué demuestra |
+|---|---|
+| `bun install --frozen-lockfile --ignore-scripts` | El lockfile instala tal cual en una máquina limpia, con red |
+| `bun run verify` | Chequeo de tipos, pruebas y demo pasan en Linux con Bun 1.4.4 |
+| `docker build --platform linux/amd64` | La imagen de producción se construye para `linux/amd64`, la arquitectura que exige Cloud Run |
+| `scripts/smoke-container.sh` | Dentro de la imagen y con `--network none`: no corre como root, escribe en `out/`, procesa los seis casos y crea 4 órdenes, y atiende HTTP/SSE con un modelo simulado en `127.0.0.1`. Después arranca el CMD real de la imagen (liveness 200, readiness 503 sin llaves, front 200) y lo apaga con SIGTERM con código de salida 0 |
+| `bun test /app/src` en la imagen, `--network none` | La suite pasa con las dependencias de producción y sin red |
+| `bun run package` y extracción en otra carpeta | El paquete se genera y, ya extraído, instala con lockfile fijado y pasa `bun run verify` |
+
+Lo verificado es lo que ese workflow ejecuta y nada más. Una anotación de GitHub avisa de que
+`actions/checkout@v4` y `actions/upload-artifact@v4` usan Node 20, en desuso, y
+se fuerzan a Node 24. Es una advertencia, no un fallo.
+
 ## Pendiente de reverificar
 
-Una versión anterior de este documento daba estas comprobaciones por
-hechas, con las cifras de entonces (130 pruebas, 28 comprobaciones de la
-demo). Hoy no las repetí y no las afirmo:
+Estas comprobaciones no las repetí hoy ni las cubre el workflow. Una versión
+anterior de este documento daba por hechas varias de ellas, con las cifras de
+entonces (130 pruebas, 28 comprobaciones de la demo):
 
 | Comprobación | Estado |
 |---|---|
-| Suite completa en macOS | Pendiente de reverificar |
-| Imagen de producción Linux ARM64, `--network none` (suite, seis casos, UID 1000, HTTP/SSE) | Pendiente de reverificar; hoy no hay Docker en esta máquina |
-| Imagen Linux AMD64 bajo emulación (la arquitectura que usa Cloud Run) | Pendiente de reverificar |
-| Arranque y apagado del CMD real de la imagen (liveness 200, readiness 503 sin llaves, SIGTERM) | Pendiente de reverificar |
-| `docker compose up --build` con `.env` | Pendiente de reverificar; no lo ejecuté |
-| `bun run package` y verificación del checksum desde una extracción nueva | Pendiente de reverificar |
-| Workflow de CI (`.github/workflows/verify.yml`) | Pendiente de reverificar; no lo ejecuté |
-| Instalación offline con lockfile fijado | Pendiente de reverificar; hoy instalé con red y sin `--frozen-lockfile` |
-| HTTP real en loopback | Pendiente de reverificar; hoy solo confirmo que la suite pasó |
+| Suite completa en macOS | Pendiente de reverificar; el CI solo corre en Linux |
+| Imagen de producción Linux ARM64, `--network none` | Pendiente de reverificar; el CI construye solo `linux/amd64` y en esta máquina no hay Docker |
+| `docker compose up --build` con `.env` | Pendiente de reverificar; ni yo ni el workflow lo ejecutamos |
+| Verificación del checksum del paquete (`shasum -a 256 -c`) | Pendiente de reverificar; el workflow genera el `.sha256` pero no lo comprueba |
+| Instalación offline con lockfile fijado | Pendiente de reverificar; el CI instala con red y en mi máquina instalé con red y sin `--frozen-lockfile` |
 
 ## Defectos corregidos
 
